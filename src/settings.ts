@@ -1,3 +1,5 @@
+// code for the setting page of plugin
+
 import { App, PluginSettingTab, Setting, TextComponent } from 'obsidian'
 import SharePlugin from './main'
 
@@ -38,6 +40,9 @@ export interface ShareSettings {
   shareUnencrypted: boolean;
   authRedirect: string | null;
   debug: number;
+  addFirst: string;
+  addLast: string;
+  excludePage: string;
 }
 
 export const DEFAULT_SETTINGS: ShareSettings = {
@@ -55,19 +60,22 @@ export const DEFAULT_SETTINGS: ShareSettings = {
   clipboard: true,
   shareUnencrypted: false,
   authRedirect: null,
-  debug: 0
+  debug: 0,
+  addFirst: `<a  data-href="RyanHuang's Blog" href="RyanHuang's Blog" class="internal-link" target="_blank" rel="noopener" style="text-decoration:none; color:#fff;"><span style="background-color: #fff2;padding: 12px 40px 12px 32px;border-radius: 48px;font-size:14px;position: fixed;left: calc(50% - 66px);bottom: 5%;z-index:1000;backdrop-filter: blur(8px);border:0.5px solid #fff4"> 🏠 Home</span></a>`,
+  addLast: `<div style="height:80px"></div>`,
+  excludePage: "RyanHuang's Blog",
 }
 
 export class ShareSettingsTab extends PluginSettingTab {
   plugin: SharePlugin
   apikeyEl: TextComponent
 
-  constructor (app: App, plugin: SharePlugin) {
+  constructor(app: App, plugin: SharePlugin) {
     super(app, plugin)
     this.plugin = plugin
   }
 
-  display (): void {
+  display(): void {
     const { containerEl } = this
 
     containerEl.empty()
@@ -92,6 +100,56 @@ export class ShareSettingsTab extends PluginSettingTab {
             await this.plugin.saveSettings()
           })
       })
+
+    new Setting(containerEl)
+      .setName('HTML options')
+      .setHeading()
+
+    // add front
+    new Setting(containerEl)
+      .setName('Add front')
+      .setDesc('The Code Add first')
+      .addText(inputEl => {
+        inputEl
+          .setPlaceholder('The Code Add first')
+          .setValue(this.plugin.settings.addFirst)
+          .onChange(async (value) => {
+            this.plugin.settings.addFirst = value
+            await this.plugin.saveSettings()
+          })
+      })
+
+    // add front
+    new Setting(containerEl)
+      .setName('Add last')
+      .setDesc('The Code Add last')
+      .addText(inputEl => {
+        inputEl
+          .setPlaceholder('The Code Add last')
+          .setValue(this.plugin.settings.addLast)
+          .onChange(async (value) => {
+            this.plugin.settings.addLast = value
+            await this.plugin.saveSettings()
+          })
+      })
+
+    // add front
+    new Setting(containerEl)
+      .setName('Exclude page')
+      .setDesc('The Name of Exclude page')
+      .addText(inputEl => {
+        inputEl
+          .setPlaceholder('The Name of Exclude page')
+          .setValue(this.plugin.settings.excludePage)
+          .onChange(async (value) => {
+            this.plugin.settings.excludePage = value
+            await this.plugin.saveSettings()
+          })
+      })
+
+    new Setting(containerEl)
+      .setName('Local YAML field')
+      .setHeading()
 
     // Local YAML field
     new Setting(containerEl)
@@ -239,7 +297,7 @@ export class ShareSettingsTab extends PluginSettingTab {
   }
 }
 
-function addDocs (setting: Setting, url: string) {
+function addDocs(setting: Setting, url: string) {
   setting.descEl.createEl('br')
   setting.descEl.createEl('a', {
     text: 'View the documentation',

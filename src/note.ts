@@ -51,6 +51,7 @@ export interface ViewModes extends View {
 export default class Note {
   plugin: SharePlugin
   leaf: WorkspaceLeaf
+  indexLeaf: WorkspaceLeaf
   status: StatusMessage
   css: string
   cssRules: CSSRule[]
@@ -64,7 +65,7 @@ export default class Note {
   elements: ElementStyle[]
   expiration?: number
 
-  constructor (plugin: SharePlugin) {
+  constructor(plugin: SharePlugin) {
     this.plugin = plugin
     // .getLeaf() doesn't return a `previewMode` property when a note is pinned,
     // so use the activeEditor.leaf
@@ -79,15 +80,17 @@ export default class Note {
    * @param key
    * @return {string} The name (key) of a frontmatter property
    */
-  field (key: YamlField): string {
+  field(key: YamlField): string {
     return this.plugin.field(key)
   }
 
-  async share () {
+  async share() {
     if (!this.plugin.settings.apiKey) {
       this.plugin.authRedirect('share').then()
       return
     }
+
+    console.log("🚀 share:", this.leaf)
 
     // Create a semi-permanent status notice which we can update
     this.status = new StatusMessage('Parsing note content, please do not change to another note while this message is displayed.', StatusType.Default, 60 * 1000)
@@ -323,12 +326,260 @@ export default class Note {
 
     this.status.hide()
     new StatusMessage(shareMessage, StatusType.Success)
+    console.log("🚀 share", title)
+  }
+
+  async indexShare() {
+    if (!this.plugin.settings.apiKey) {
+      this.plugin.authRedirect('share').then()
+      return
+    }
+
+    const indexFile = this.plugin.app.vault.getFileByPath(`${this.plugin.settings.excludePage}.md`)
+    if (indexFile) { await this.leaf.openFile(indexFile) }
+    console.log("🚀 indexShare:", this.leaf)
+
+    // Create a semi-permanent status notice which we can update
+    this.status = new StatusMessage('Parsing note content, please do not change to another note while this message is displayed.', StatusType.Default, 60 * 1000)
+
+    const startMode = this.leaf.getViewState()
+    const previewMode = this.leaf.getViewState()
+    previewMode.state.mode = 'preview'
+    await this.leaf.setViewState(previewMode)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    // Scroll the view to the top to ensure we get the default margins for .markdown-preview-pusher
+    // @ts-ignore // 'view.previewMode'
+    this.leaf.view.previewMode.applyScroll(0)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    try {
+      const view = this.leaf.view as ViewModes
+      const renderer = view.modes.preview.renderer
+      // Copy classes and styles
+      this.elements.push(getElementStyle('html', document.documentElement))
+      const bodyStyle = getElementStyle('body', document.body)
+      bodyStyle.classes.push('share-note-plugin') // Add a targetable class for published notes
+      this.elements.push(bodyStyle)
+      this.elements.push(getElementStyle('preview', renderer.previewEl))
+      this.elements.push(getElementStyle('pusher', renderer.pusherEl))
+      this.contentDom = new DOMParser().parseFromString(await this.querySelectorAll(this.leaf.view as ViewModes), 'text/html')
+      this.cssRules = []
+      Array.from(document.styleSheets)
+        .forEach(x => Array.from(x.cssRules)
+          .forEach(rule => {
+            this.cssRules.push(rule)
+          }))
+      this.css = this.cssRules.map(rule => rule.cssText).join('').replace(/\n/g, '')
+    } catch (e) {
+      console.log(e)
+      this.status.hide()
+      new StatusMessage('Failed to parse current note, check console for details', StatusType.Error)
+      return
+    }
+
+    // Reset the view to the original mode
+    // The timeout is required, even though we 'await' the preview mode setting earlier
+    setTimeout(() => { this.leaf.setViewState(startMode) }, 200)
+
+    this.status.setStatus('Processing note...')
+    const file = this.plugin.app.workspace.getActiveFile()
+    if (!(file instanceof TFile)) {
+      // No active file
+      this.status.hide()
+      new StatusMessage('There is no active file to share')
+      return
+    }
+    this.meta = this.plugin.app.metadataCache.getFileCache(file)
+
+    // Generate the HTML file for uploading
+
+    if (this.plugin.settings.removeYaml) {
+      // Remove frontmatter to avoid sharing unwanted data
+      this.contentDom.querySelector('div.metadata-container')?.remove()
+      this.contentDom.querySelector('pre.frontmatter')?.remove()
+      this.contentDom.querySelector('div.frontmatter-container')?.remove()
+    } else {
+      // Frontmatter property labels are <input> types with no `value`.
+      // Take the `aria-label` value and use that as the displayed value.
+      this.contentDom.querySelectorAll('input.metadata-property-key-input')
+        .forEach(el => {
+          el.setAttribute('value', el.getAttribute('aria-label') || '')
+        })
+    }
+    if (this.plugin.settings.removeBacklinksFooter) {
+      // Remove backlinks footer
+      this.contentDom.querySelector('div.embedded-backlinks')?.remove()
+    }
+
+    // Fix callout icons
+    const defaultCalloutType = this.getCalloutIcon(selectorText => selectorText === '.callout') || 'pencil'
+    for (const el of this.contentDom.getElementsByClassName('callout')) {
+      // Get the callout icon from the CSS. I couldn't find any way to do this from the DOM,
+      // as the elements may be far down below the fold and are not populated.
+      const type = el.getAttribute('data-callout')
+      let icon = this.getCalloutIcon(selectorText => selectorText.includes(`data-callout="${type}"`)) || defaultCalloutType
+      icon = icon.replace('lucide-', '')
+      // Replace the existing icon so we:
+      // a) don't get double-ups, and
+      // b) have a consistent style
+      const iconEl = el.querySelector('div.callout-icon')
+      const svgEl = iconEl?.querySelector('svg')
+      if (svgEl) {
+        svgEl.outerHTML = `<svg width="16" height="16" data-share-note-lucide="${icon}"></svg>`
+      }
+    }
+
+    // Replace links
+    for (const el of this.contentDom.querySelectorAll<HTMLElement>('a.internal-link')) {
+      const href = el.getAttribute('href')
+      const match = href ? href.match(/^([^#]+)/) : null
+      if (href?.match(/^#/)) {
+        // Anchor link to a document heading, we need to add custom Javascript to jump to that heading
+        const selector = `[data-heading="${href.slice(1)}"]`
+        if (this.contentDom.querySelectorAll(selector)?.[0]) {
+          el.setAttribute('onclick', `document.querySelectorAll('${selector}')[0].scrollIntoView(true)`)
+        }
+        el.removeAttribute('target')
+        el.removeAttribute('href')
+        continue
+      } else if (match) {
+        // A link to another note - check to see if we can link to an already shared note
+        const linkedFile = this.plugin.app.metadataCache.getFirstLinkpathDest(match[1], '')
+        if (linkedFile instanceof TFile) {
+          const linkedMeta = this.plugin.app.metadataCache.getFileCache(linkedFile)
+          if (linkedMeta?.frontmatter?.[this.field(YamlField.link)]) {
+            // This file is shared, so update the link with the share URL
+            el.setAttribute('href', linkedMeta.frontmatter[this.field(YamlField.link)])
+            el.removeAttribute('target')
+            continue
+          }
+        }
+      }
+      // This file is not shared, so remove the link and replace with the non-link content
+      el.replaceWith(el.innerHTML)
+    }
+    for (const el of this.contentDom.querySelectorAll<HTMLElement>('a.external-link')) {
+      // Remove target=_blank from external links
+      el.removeAttribute('target')
+    }
+
+    // Note options
+    this.expiration = this.getExpiration()
+
+    // Process CSS and images
+    const uploadResult = await this.processMedia()
+    this.cssResult = uploadResult.css
+    await this.processCss()
+
+    /*
+     * Encrypt the note contents
+     */
+
+    // Use previous name and key if they exist, so that links will stay consistent across updates
+    let decryptionKey = ''
+    if (this.meta?.frontmatter?.[this.field(YamlField.link)]) {
+      const match = parseExistingShareUrl(this.meta.frontmatter[this.field(YamlField.link)])
+      if (match) {
+        this.template.filename = match.filename
+        decryptionKey = match.decryptionKey
+      }
+    }
+    this.template.encrypted = this.isEncrypted
+
+    // Select which source for the title
+    let title
+    switch (this.plugin.settings.titleSource) {
+      case TitleSource['First H1']:
+        title = this.contentDom.getElementsByTagName('h1')?.[0]?.innerText
+        break
+      case TitleSource['Frontmatter property']:
+        title = this.meta?.frontmatter?.[this.field(YamlField.title)]
+        break
+    }
+    if (!title) {
+      // Fallback to basename if either of the above fail
+      title = file.basename
+    }
+
+    if (this.isEncrypted) {
+      this.status.setStatus('Encrypting note...')
+      const plaintext = JSON.stringify({
+        content: this.contentDom.body.innerHTML,
+        basename: title
+      })
+      // Encrypt the note
+      const encryptedData = await encryptString(plaintext, decryptionKey)
+      this.template.content = JSON.stringify({
+        ciphertext: encryptedData.ciphertext,
+        iv: encryptedData.iv
+      })
+      decryptionKey = encryptedData.key
+    } else {
+      // This is for notes shared without encryption, using the
+      // share_unencrypted frontmatter property
+      this.template.content = this.contentDom.body.innerHTML
+      this.template.title = title
+      // Create a meta description preview based off the <p> elements
+      const desc = Array.from(this.contentDom.querySelectorAll('p'))
+        .map(x => x.innerText).filter(x => !!x)
+        .join(' ')
+      this.template.description = desc.length > 200 ? desc.slice(0, 197) + '...' : desc
+    }
+
+    // Make template value replacements
+    this.template.width = this.plugin.settings.noteWidth
+    // Set theme light/dark
+    if (this.plugin.settings.themeMode !== ThemeMode['Same as theme']) {
+      this.elements
+        .filter(x => x.element === 'body')
+        .forEach(item => {
+          // Remove the existing theme setting
+          item.classes = item.classes.filter(cls => cls !== 'theme-dark' && cls !== 'theme-light')
+          // Add the preferred theme setting (dark/light)
+          item.classes.push('theme-' + ThemeMode[this.plugin.settings.themeMode].toLowerCase())
+        })
+    }
+    this.template.elements = this.elements
+    // Check for MathJax
+    this.template.mathJax = !!this.contentDom.body.innerHTML.match(/<mjx-container/)
+
+    // Share the file
+    this.status.setStatus('Uploading note...')
+    let shareLink = await this.plugin.api.createNote(this.template, this.expiration)
+    requestUrl(shareLink).then().catch() // Fetch the uploaded file to pull it through the cache
+
+    // Add the decryption key to the share link
+    if (shareLink && this.isEncrypted) {
+      shareLink += '#' + decryptionKey
+    }
+
+    let shareMessage = 'The note has been shared'
+    if (shareLink) {
+      await this.plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        // Update the frontmatter with the share link
+        frontmatter[this.field(YamlField.link)] = shareLink
+        frontmatter[this.field(YamlField.updated)] = moment().format()
+      })
+      if (this.plugin.settings.clipboard || this.isForceClipboard) {
+        // Copy the share link to the clipboard
+        try {
+          await navigator.clipboard.writeText(shareLink)
+          shareMessage = `${shareMessage} and the link is copied to your clipboard 📋`
+        } catch (e) {
+          // If there's an error here it's because the user clicked away from the Obsidian window
+        }
+        this.isForceClipboard = false
+      }
+    }
+
+    this.status.hide()
+    new StatusMessage(shareMessage, StatusType.Success)
+    console.log("🚀 indexShare:", title)
   }
 
   /**
    * Upload media attachments
    */
-  async processMedia () {
+  async processMedia() {
     const elements = ['img', 'video']
     this.status.setStatus('Processing attachments...')
     for (const el of this.contentDom.querySelectorAll(elements.join(','))) {
@@ -375,7 +626,7 @@ export default class Note {
    * Upload theme CSS, unless this file has previously been shared,
    * or the user has requested a force re-upload
    */
-  async processCss () {
+  async processCss() {
     // Upload the main CSS file only if the user has asked for it.
     // We do it this way to ensure that the CSS the user wants on the server
     // stays that way, until they ASK to overwrite it.
@@ -461,43 +712,75 @@ export default class Note {
     }
   }
 
-  async querySelectorAll (view: ViewModes) {
+  async querySelectorAll(view: ViewModes) {
+    // 从视图参数中获取预览模式的渲染器
     const renderer = view.modes.preview.renderer
+    // 初始化 HTML 变量为空字符串
     let html = ''
+    // 创建一个 Promise，在内部等待所有元素被渲染完成
     await new Promise<void>(resolve => {
+      // 初始化计数器
       let count = 0
+      // 初始化正在解析的计数器
       let parsing = 0
+      // 创建定时器，每100毫秒执行一次
       const timer = setInterval(() => {
         try {
+          // 获取渲染器的节块（sections）属性
           const sections = renderer.sections
+          // 增加尝试渲染次数
           count++
+          // 如果渲染器正在解析，增加正在解析的次数
           if (renderer.parsing) parsing++
+          // 如果尝试渲染的次数大于正在解析的次数，至少有一些元素已经渲染完成
           if (count > parsing) {
-            // Check the final sections to see if they have rendered
+            // 检查最后几个节块，以查看它们是否已经渲染
             let rendered = 0
+            // 如果节块数量大于12个，只检查最后7个节块
             if (sections.length > 12) {
               sections.slice(sections.length - 7, sections.length - 1).forEach((section: PreviewSection) => {
+                // 如果节块的 innerHTML 不为空，则表示已渲染
                 if (section.el.innerHTML) rendered++
               })
+              // 如果渲染的节块数量大于3，认为大部分元素已经渲染完成
               if (rendered > 3) count = 100
             } else {
+              // 如果节块数量少于等于12个，认为大部分元素已经渲染完成
               count = 100
             }
           }
+          // 如果尝试渲染的次数超过40次，表示大部分元素已经渲染完成
           if (count > 40) {
-            html = this.reduceSections(renderer.sections)
+            // 将所有节块的 HTML 内容合并成一个字符串
+            html = this.reduceSections(renderer.sections, false)
+            const regexString = /<div class="inline-title" (.*?)>(.*?)<\/div>/
+            const matchArray = html.match(regexString)
+            // console.log("🚀 ~ Note ~ timer ~ matchArray:", matchArray)
+            if (matchArray && matchArray[2] === this.plugin.settings.excludePage) {
+              html = this.reduceSections(renderer.sections, true)
+              // console.log("🚀 ~ Note ~ timer ~ html,blog:", html)
+              html = html.replace(/(.*)<div class="inline-title" (.*?)>(.*?)<\/div>(.*)/gm, (_, $1, $2, $3, $4) => $1 + '<div class="inline-title" style="display:none"' + $2 + '>' + $3 + $4)
+            } else {
+              // html = this.reduceSections(renderer.sections, false)
+              // console.log("🚀 ~ Note ~ timer ~ html,notblog:", html)
+            }
+            // 解析 Promise
+            clearInterval(timer)
             resolve()
           }
         } catch (e) {
+          // 捕获错误并清除定时器
           clearInterval(timer)
+          // 解析 Promise
           resolve()
         }
       }, 100)
     })
+    // 返回合并后的 HTML 字符串
     return html
   }
 
-  getCalloutIcon (test: (selectorText: string) => boolean) {
+  getCalloutIcon(test: (selectorText: string) => boolean) {
     const rule = this.cssRules
       .find((rule: CSSStyleRule) => rule.selectorText && test(rule.selectorText) && rule.style.getPropertyValue('--callout-icon')) as CSSStyleRule
     if (rule) {
@@ -506,16 +789,23 @@ export default class Note {
     return ''
   }
 
-  reduceSections (sections: { el: HTMLElement }[]) {
-    return sections.reduce((p: string, c) => p + c.el.outerHTML, '')
+  reduceSections(sections: { el: HTMLElement }[], isIndex: boolean) {
+
+    const rawHtml = sections.reduce((p: string, c) => p + c.el.outerHTML, '')
+    const myButton = this.plugin.settings.addFirst
+    const myDiv = this.plugin.settings.addLast
+    const editHtml = myButton + rawHtml + myDiv
+    const res = isIndex ? rawHtml : editHtml
+    return res
   }
+
 
   /**
    * Turn the font mime-type into an extension.
    * @param {string} mimeType
    * @return {string|undefined}
    */
-  extensionFromMime (mimeType: string): string | undefined {
+  extensionFromMime(mimeType: string): string | undefined {
     const mimes = cssAttachmentWhitelist
     return Object.keys(mimes).find(x => mimes[x].includes((mimeType || '').toLowerCase()))
   }
@@ -523,35 +813,35 @@ export default class Note {
   /**
    * Get the value of a frontmatter property
    */
-  getProperty (field: YamlField) {
+  getProperty(field: YamlField) {
     return this.meta?.frontmatter?.[this.plugin.field(field)]
   }
 
   /**
    * Force all related assets to upload again
    */
-  forceUpload () {
+  forceUpload() {
     this.isForceUpload = true
   }
 
   /**
    * Copy the shared link to the clipboard, regardless of the user setting
    */
-  forceClipboard () {
+  forceClipboard() {
     this.isForceClipboard = true
   }
 
   /**
    * Enable/disable encryption for the note
    */
-  shareAsPlainText (isPlainText: boolean) {
+  shareAsPlainText(isPlainText: boolean) {
     this.isEncrypted = !isPlainText
   }
 
   /**
    * Calculate an expiry datetime from the provided expiry duration
    */
-  getExpiration () {
+  getExpiration() {
     const whitelist = ['minute', 'hour', 'day', 'month']
     const expiration = this.getProperty(YamlField.expires) || this.plugin.settings.expiry
     if (expiration) {
